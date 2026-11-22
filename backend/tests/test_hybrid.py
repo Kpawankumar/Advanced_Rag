@@ -46,7 +46,7 @@ def test_v1_migration_preserves_existing_data_and_is_idempotent(tmp_path):
     initialize(path)
     initialize(path)
     with connection(path) as con:
-        assert con.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert con.execute("PRAGMA user_version").fetchone()[0] == 5
         assert con.execute("SELECT question FROM query_runs").fetchone()[0] == "previous"
         assert con.execute("SELECT status FROM vector_jobs").fetchone()[0] == "pending"
 
@@ -54,7 +54,7 @@ def test_v1_migration_preserves_existing_data_and_is_idempotent(tmp_path):
 def test_unknown_schema_is_not_downgraded(tmp_path):
     path = tmp_path / "future.db"
     with sqlite3.connect(path) as con:
-        con.execute("PRAGMA user_version=5")
+        con.execute("PRAGMA user_version=6")
     with pytest.raises(RuntimeError):
         initialize(path)
 

@@ -8,6 +8,8 @@ export type Document = {
   warnings: string[];
   error_code: string | null;
   error_message: string | null;
+  source_url?: string | null;
+  kind?: "pdf" | "text" | "url";
   vector_status?: string | null;
   vector_error?: string | null;
   summary_status?: string | null;
@@ -75,11 +77,33 @@ export type SummaryResponse = {
   error: string | null;
   created_at?: number;
 };
+export type AssistantRun = {
+  id: string;
+  kind: "coding" | "chat";
+  task: string;
+  question: string;
+  status: "answered";
+  answer: string;
+  language: string;
+  grounded: boolean;
+  sources: Evidence[];
+  model: string | null;
+  verification: string;
+  retrieval_mode: string | null;
+  timings: { retrieval_ms: number; generation_ms: number; total_ms: number };
+};
 export type Readiness = {
   worker_active: boolean;
   model: { reachable: boolean; model_available: boolean; model: string };
   default_retrieval_mode: string;
   answer_mode?: string;
+  coding?: {
+    provider: string;
+    reachable: boolean;
+    model_available: boolean;
+    model: string;
+    error?: string;
+  };
   retrieval: {
     enabled: boolean;
     loaded: boolean;

@@ -197,6 +197,29 @@ class HybridIndex:
         ]
         self.client.upsert(self.collection, points, wait=True)
 
+    def delete_document(self, document_id: str) -> None:
+        """Remove a deleted document's vectors; best-effort so deletion never hangs."""
+        if not (self.loaded and self.client and self.collection):
+            return
+        try:
+            with self.lock:
+                self.client.delete(
+                    self.collection,
+                    models.FilterSelector(
+                        filter=models.Filter(
+                            must=[
+                                models.FieldCondition(
+                                    key="document_id",
+                                    match=models.MatchValue(value=document_id),
+                                )
+                            ]
+                        )
+                    ),
+                    wait=True,
+                )
+        except Exception:
+            log.exception("Vector cleanup failed for %s", document_id)
+
     def _scope(self, scope):
         with connection(self.settings.database) as con:
             sql = """SELECT d.id, v.status, v.generation FROM documents d

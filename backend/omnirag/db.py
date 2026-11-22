@@ -85,6 +85,22 @@ CREATE TABLE document_summaries (
 );
 """
 
+MIGRATION_5 = """
+CREATE TABLE assistant_runs (
+    id TEXT PRIMARY KEY,
+    created_at REAL NOT NULL,
+    kind TEXT NOT NULL CHECK(kind IN ('coding','chat')),
+    task TEXT NOT NULL,
+    question TEXT NOT NULL,
+    response TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_assistant_runs_created ON assistant_runs(created_at);
+"""
+
+MIGRATION_5_ALTERS = [
+    "ALTER TABLE documents ADD COLUMN source_url TEXT",
+]
+
 
 @contextmanager
 def connection(path: Path):
@@ -107,7 +123,7 @@ def initialize(path: Path) -> None:
         con.execute("PRAGMA journal_mode=WAL")
         con.execute("BEGIN IMMEDIATE")
         version = con.execute("PRAGMA user_version").fetchone()[0]
-        if version > 4:
+        if version > 5:
             raise RuntimeError("Database schema is newer than this application.")
         if version == 0:
             for statement in SCHEMA.split(";"):
@@ -128,7 +144,18 @@ def initialize(path: Path) -> None:
             for statement in MIGRATION_4.split(";"):
                 if statement.strip():
                     con.execute(statement)
-        con.execute("PRAGMA user_version=4")
+            version = 4
+        if version == 4:
+            for statement in MIGRATION_5.split(";"):
+                if statement.strip():
+                    con.execute(statement)
+            for statement in MIGRATION_5_ALTERS:
+                try:
+                    con.execute(statement)
+                except sqlite3.OperationalError as exc:
+                    if "duplicate column" not in str(exc).lower():
+                        raise
+        con.execute("PRAGMA user_version=5")
 
 
 def public_document(row: sqlite3.Row) -> dict:
@@ -146,6 +173,8 @@ def public_document(row: sqlite3.Row) -> dict:
     )
     result = {key: row[key] for key in fields}
     result["warnings"] = json.loads(row["warnings"])
+    keys = row.keys()
+    result["source_url"] = row["source_url"] if "source_url" in keys else None
     return result
 
 
@@ -295,3 +324,84 @@ def finish_job(path: Path, job: dict, result: dict) -> bool:
             (job["id"],),
         )
         return True
+
+
+def insert_ready_document(path: Path, document: dict, result: dict) -> None:
+    """Store an already-extracted text document (DOCX/TXT/MD/CSV/JSON/URL) as ready.
+
+    PDFs keep the leased worker path; these formats extract fast enough to ingest
+    synchronously with the same chunk/FTS/vector pipeline and synthetic pages.
+    """
+    with connection(path) as con:
+        con.execute("BEGIN IMMEDIATE")
+        existing = con.execute(
+            "SELECT id FROM documents WHERE sha256=?", (document["sha256"],)
+        ).fetchone()
+        if existing:
+            raise ValueError("duplicate")
+        con.execute(
+            "INSERT INTO documents(id,name,sha256,size_bytes,created_at,status,"
+            "page_count,chunk_count,warnings,source_url) VALUES(?,?,?,?,?,'ready',?,?,?,?)",
+            (
+                document["id"],
+                document["name"],
+                document["sha256"],
+                document["size_bytes"],
+                time.time(),
+                result["page_count"],
+                len(result["chunks"]),
+                json.dumps(result["warnings"]),
+                document.get("source_url"),
+            ),
+        )
+        for page in result["pages"]:
+            con.execute(
+                "INSERT INTO page_extractions VALUES(?,?,?,?)",
+                (document["id"], page["page"], page["method"], json.dumps(page)),
+            )
+        for chunk in result["chunks"]:
+            chunk_id = f"{document['id']}:{chunk['page']}:{chunk['ordinal']}"
+            con.execute(
+                "INSERT INTO chunks VALUES(?,?,?,?,?)",
+                (chunk_id, document["id"], chunk["page"], chunk["ordinal"], chunk["text"]),
+            )
+            con.execute("INSERT INTO chunks_fts VALUES(?,?)", (chunk_id, chunk["text"]))
+        con.execute("INSERT INTO vector_jobs(document_id) VALUES(?)", (document["id"],))
+
+
+def delete_document_everywhere(path: Path, document_id: str) -> dict:
+    """Remove a document and all of its derived data; returns the row for cleanup."""
+    with connection(path) as con:
+        con.execute("BEGIN IMMEDIATE")
+        row = con.execute("SELECT * FROM documents WHERE id=?", (document_id,)).fetchone()
+        if row is None:
+            return {}
+        con.execute(
+            "DELETE FROM chunks_fts WHERE chunk_id IN "
+            "(SELECT id FROM chunks WHERE document_id=?)",
+            (document_id,),
+        )
+        con.execute("DELETE FROM chunks WHERE document_id=?", (document_id,))
+        con.execute("DELETE FROM page_extractions WHERE document_id=?", (document_id,))
+        con.execute("DELETE FROM vector_jobs WHERE document_id=?", (document_id,))
+        con.execute("DELETE FROM document_summaries WHERE document_id=?", (document_id,))
+        con.execute("DELETE FROM documents WHERE id=?", (document_id,))
+        return dict(row)
+
+
+def save_assistant_run(
+    path: Path, run_id: str, kind: str, task: str, question: str, response: dict
+) -> None:
+    with connection(path) as con:
+        con.execute(
+            "INSERT INTO assistant_runs VALUES(?,?,?,?,?,?)",
+            (run_id, time.time(), kind, task, question, json.dumps(response)),
+        )
+
+
+def assistant_history(path: Path, limit: int = 20) -> list[dict]:
+    with connection(path) as con:
+        rows = con.execute(
+            "SELECT response FROM assistant_runs ORDER BY created_at DESC LIMIT ?", (limit,)
+        ).fetchall()
+        return [json.loads(row[0]) for row in rows]

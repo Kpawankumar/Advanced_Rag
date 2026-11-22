@@ -32,12 +32,45 @@ See the [Phase 3 guide](docs/PHASE3.md) and [observed Mac validation](docs/PHASE
 
 See the [Phase 2 guide](docs/PHASE2.md) for indexing, model pinning, configuration and failure behavior, and [Phase 2 validation](docs/PHASE2_VALIDATION.md) for observed results. Existing documents are automatically backfilled; source IDs and history are preserved. Choose **Keyword search**, **Semantic search**, **Hybrid search**, or **Hybrid + reranking** in the workspace.
 
-**Scope:** one private owner on one Mac. Keep the app on `127.0.0.1`; it is not configured for public hosting. Citation validation checks that source IDs exist and quotes occur in retrieved text. It does not establish semantic entailment or guarantee factual correctness.
+**Scope:** one private owner on one machine. Keep the app on `127.0.0.1`; it is not configured for public hosting. Citation validation checks that source IDs exist and quotes occur in retrieved text. It does not establish semantic entailment or guarantee factual correctness.
+
+## AI coding assistant and general chat (merged from the RAG project)
+
+The workspace has three assistant modes, switched above the question box:
+
+- **Knowledge Assistant** — the original grounded document workflow (citations, verification, overviews).
+- **Coding Assistant** — code generation, explanation, debugging, improvement and review. Pick a task chip
+  (Auto-detect/Generate/Explain/Debug/Improve/Review), optionally attach code and an error/traceback, and send.
+  Answers render as language-labeled code blocks with syntax highlighting and a copy button. Generated and
+  user-submitted code is **never executed** anywhere.
+- **General AI** — plain conversation, independent of the documents.
+
+**Knowledge-base-aware coding:** select a document scope in Coding Assistant mode and the request retrieves
+passages from your uploaded documentation (API references, project notes, code listings) and grounds the
+generated code in them, listing the passages used as sources. Leave the scope empty for general coding
+questions — retrieval is not forced. Follow-up coding questions keep the last two exchanges in context.
+
+**Model providers** (`OMNIRAG_CODE_PROVIDER`): `ollama` (default) uses the same local Ollama gateway as the
+grounded path, with an optional separate `OMNIRAG_OLLAMA_CODE_MODEL`; `openrouter` enables the OpenRouter
+OpenAI-compatible client ported from the RAG project (set `OMNIRAG_OPENROUTER_API_KEY`). Both stay disabled
+until configured; nothing is hard-coded.
+
+## Document and web ingestion
+
+- **Formats:** PDF (async worker with OCR) plus **DOCX, TXT, Markdown, CSV and JSON**, which extract
+  synchronously into the same chunk/FTS/vector pipeline with synthetic pages for page-linked citations.
+- **Web pages:** paste an `http(s)` URL under *Add a web page*. The fetcher follows redirects manually,
+  resolves DNS before connecting and rejects private, loopback, link-local and reserved addresses (SSRF guard),
+  with size and time limits. Page text is indexed like a document; the source panel links back to the page.
+- **Deletion:** every document row has a delete button that removes the document, its chunks, full-text
+  index entries, page extractions, vector index points and stored file together.
+- Empty or unparseable files fail with a visible error code instead of a silent bad index.
 
 ## Using the installed app
 
-1. **Upload** — drag a PDF onto *Add a document*. The sidebar shows extraction,
-   OCR and indexing states; a failed upload shows the reason with a retry button.
+1. **Upload** — drag a PDF, DOCX, TXT, Markdown, CSV or JSON file onto *Add a document*,
+   or paste a web page URL. The sidebar shows extraction, OCR and indexing states; a
+   failed upload shows the reason with a retry button. Every source has a delete button.
 2. **Overview** — click a document name to select it. The *About* card shows the
    document type, a short summary, topics and key points once generated
    (automatically for new uploads; press **Summarize document** once for older ones).
@@ -130,6 +163,14 @@ uv run ruff check backend scripts
 uv run pytest -q
 npm --prefix frontend run build
 uv run python scripts/check_http.py
+```
+
+Verify the AI coding assistant end to end (start the API first; scenarios 1-7 cover generation,
+explanation, debugging, improvement, review, knowledge-base-grounded coding and follow-up context,
+plus the history/readiness/deletion contracts the UI uses):
+
+```bash
+uv run python scripts/verify_coding.py --base-url http://127.0.0.1:8000
 ```
 
 Run the Phase 4 evaluation from the project root, after local retrieval models are prepared:

@@ -135,8 +135,10 @@ def test_session_survives_restart_and_new_login_rotates_it(settings, owner):
 
 
 def test_credential_permissions_and_no_overwrite(owner):
-    assert os.stat(owner.path).st_mode & 0o777 == 0o600
-    assert os.stat(owner.directory).st_mode & 0o777 == 0o700
+    # POSIX permission bits only exist on POSIX; Windows reports a stub mask.
+    if os.name == "posix":
+        assert os.stat(owner.path).st_mode & 0o777 == 0o600
+        assert os.stat(owner.directory).st_mode & 0o777 == 0o700
     with pytest.raises(ValueError):
         owner.set_password("a different long password")
     assert owner.verify(PASSWORD)

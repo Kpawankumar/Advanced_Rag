@@ -36,7 +36,19 @@ def run_parser(command, timeout):
             stdout, _ = proc.communicate(timeout=timeout)
         except BaseException:
             try:
-                os.killpg(proc.pid, signal.SIGKILL)
+                if hasattr(os, "killpg"):
+                    # The process group includes Tesseract; killing only Python
+                    # leaves OCR orphaned.
+                    os.killpg(proc.pid, signal.SIGKILL)
+                elif os.name == "nt":
+                    # Windows has no process groups; taskkill walks the process tree.
+                    subprocess.run(
+                        ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                        capture_output=True,
+                        check=False,
+                    )
+                else:
+                    proc.kill()
             except ProcessLookupError:
                 pass
             proc.communicate()

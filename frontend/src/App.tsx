@@ -7,33 +7,45 @@ import {
   Check,
   ChevronRight,
   CircleAlert,
+  Code2,
   Download,
   FileText,
   FolderOpen,
   History,
   Layers3,
   Lightbulb,
+  Link2,
   ListChecks,
   LoaderCircle,
   MessageCircleQuestion,
+  MessagesSquare,
   PanelRightClose,
+  Paperclip,
   Search,
   Sparkles,
+  Trash2,
   Upload,
   X,
 } from "lucide-react";
 import { fileUrl, pagePreviewUrl, request } from "./api";
 import type {
+  AssistantRun,
   Citation,
   Document,
   QueryResult,
   Readiness,
   SummaryResponse,
 } from "./api";
+import { AnswerBody } from "./code";
 
 const examples = [
   "What is the supplier’s delivery window?",
   "What does the policy say about acceptance review?",
+];
+const codingExamples = [
+  "Write a Python function that checks whether a number is prime.",
+  "Explain this React hook and its execution flow.",
+  "Why does my API return 500? Here is the traceback.",
 ];
 const retrievalNames: Record<string, string> = {
   bm25: "Keyword search",
@@ -52,17 +64,37 @@ const statusLabels: Record<string, string> = {
   insufficient_evidence: "Insufficient evidence",
 };
 
+const codingTaskNames: Record<string, string> = {
+  auto: "Auto-detect",
+  generate: "Generate",
+  explain: "Explain",
+  debug: "Debug",
+  improve: "Improve",
+  review: "Review",
+};
+
+type Mode = "knowledge" | "coding" | "general";
 type ThreadTurn = { question: string; answer: string; documentIds: string[] };
+type AssistantTurn = { question: string; answer: string };
 
 export default function App({ authenticated = false }: { authenticated?: boolean }) {
   const [documents, setDocuments] = useState<Document[]>([]);
   const [readiness, setReadiness] = useState<Readiness | null>(null);
-  const [history, setHistory] = useState<QueryResult[]>([]);
+  const [history, setHistory] = useState<(QueryResult | AssistantRun)[]>([]);
   const [question, setQuestion] = useState("");
   const [scope, setScopeState] = useState("");
   const scopeState = useRef({ id: "", revision: 0 });
   const [retrievalMode, setRetrievalMode] = useState("");
   const [result, setResult] = useState<QueryResult | null>(null);
+  const [assistant, setAssistant] = useState<AssistantRun | null>(null);
+  const [mode, setMode] = useState<Mode>("knowledge");
+  const [task, setTask] = useState("auto");
+  const [codeInput, setCodeInput] = useState("");
+  const [errorInput, setErrorInput] = useState("");
+  const [showAttach, setShowAttach] = useState(false);
+  const [assistantThread, setAssistantThread] = useState<AssistantTurn[]>([]);
+  const [pageUrl, setPageUrl] = useState("");
+  const [addingUrl, setAddingUrl] = useState(false);
   const [source, setSource] = useState<Citation | null>(null);
   const [view, setView] = useState<"workspace" | "history">("workspace");
   const [busy, setBusy] = useState(false);
@@ -80,6 +112,7 @@ export default function App({ authenticated = false }: { authenticated?: boolean
   const ready = documents.filter((d) => d.status === "ready");
   const pages = ready.reduce((total, d) => total + (d.page_count ?? 0), 0);
   const scopedDoc = ready.find((d) => d.id === scope);
+  const codingReady = readiness?.coding?.reachable ?? true;
 
   useEffect(() => {
     let active = true;
@@ -107,7 +140,7 @@ export default function App({ authenticated = false }: { authenticated?: boolean
       if (active) timer = setTimeout(refresh, 3000);
     }
     void refresh();
-    request<QueryResult[]>("/history")
+    request<(QueryResult | AssistantRun)[]>("/history")
       .then((h) => {
         if (active) setHistory(h);
       })
@@ -132,6 +165,20 @@ export default function App({ authenticated = false }: { authenticated?: boolean
     setNotice("");
     setBusy(false);
     setOverviewBusy(false);
+  }
+
+  function switchMode(next: Mode) {
+    if (mode === next) return;
+    setMode(next);
+    setResult(null);
+    setAssistant(null);
+    setAssistantThread([]);
+    setShowAttach(false);
+    setError("");
+    setNotice("");
+    if (next !== "knowledge") {
+      setTask(next === "coding" ? "auto" : "auto");
+    }
   }
 
   // Load the selected document's cached overview; a missing one is generated on demand.
@@ -161,8 +208,8 @@ export default function App({ authenticated = false }: { authenticated?: boolean
     if (!file || uploading) return;
     setError("");
     setNotice("");
-    if (!file.name.toLowerCase().endsWith(".pdf")) {
-      setError("Choose a PDF file.");
+    if (!/\.(pdf|docx|txt|md|csv|json)$/i.test(file.name)) {
+      setError("Choose a PDF, DOCX, TXT, Markdown, CSV or JSON file.");
       return;
     }
     setUploading(true);
@@ -241,6 +288,102 @@ export default function App({ authenticated = false }: { authenticated?: boolean
     }
   }
 
+  // Coding assistant and general chat share one plain-text workflow; coding
+  // requests optionally retrieve knowledge-base passages for grounded answers.
+  async function sendAssistant(event?: FormEvent, overrideQuestion?: string) {
+    event?.preventDefault();
+    const asked = (overrideQuestion ?? question).trim();
+    if (!asked || busy) return;
+    if (mode === "coding" && !codingReady) {
+      setError(
+        `The coding model is unavailable (${readiness?.coding?.model ?? "unknown"}). Start the provider or check OMNIRAG_CODE_PROVIDER settings.`,
+      );
+      return;
+    }
+    const revision = scopeState.current.revision;
+    setBusy(true);
+    setError("");
+    setNotice("");
+    setSource(null);
+    setView("workspace");
+    try {
+      const path = mode === "coding" ? "/coding/assist" : "/assistant/chat";
+      const body =
+        mode === "coding"
+          ? {
+              question: asked,
+              task,
+              code: codeInput,
+              error: errorInput,
+              document_ids: scope ? [scope] : [],
+              conversation: assistantThread.slice(-2),
+            }
+          : { question: asked, conversation: assistantThread.slice(-2) };
+      const run = await request<AssistantRun>(path, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      setHistory((h) => [run, ...h].slice(0, 20));
+      if (revision !== scopeState.current.revision) return;
+      setAssistant(run);
+      if (overrideQuestion !== undefined) setQuestion(overrideQuestion);
+      setAssistantThread((t) =>
+        [...t, { question: asked, answer: run.answer.slice(0, 2000) }].slice(-2),
+      );
+      setCodeInput("");
+      setErrorInput("");
+    } catch (e) {
+      if (revision === scopeState.current.revision) setError((e as Error).message);
+    } finally {
+      if (revision === scopeState.current.revision) setBusy(false);
+    }
+  }
+
+  async function addWebPage() {
+    const url = pageUrl.trim();
+    if (!url || addingUrl) return;
+    if (!/^https?:\/\//i.test(url)) {
+      setError("Enter an http(s) URL.");
+      return;
+    }
+    setAddingUrl(true);
+    setError("");
+    try {
+      const data = await request<{ document: Document; duplicate?: boolean }>("/urls", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url }),
+      });
+      setDocuments((docs) => [
+        data.document,
+        ...docs.filter((d) => d.id !== data.document.id),
+      ]);
+      setNotice(
+        data.duplicate
+          ? "This page is already in your workspace."
+          : `Added “${data.document.name}”. It is indexed and ready.`,
+      );
+      setPageUrl("");
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setAddingUrl(false);
+    }
+  }
+
+  async function deleteDocument(id: string) {
+    setError("");
+    try {
+      await request(`/documents/${id}`, { method: "DELETE" });
+      setDocuments((docs) => docs.filter((d) => d.id !== id));
+      if (scope === id) setScope("");
+      setNotice("Document removed from the workspace and indexes.");
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  }
+
   async function generateSummary(kind: "overview" | "detailed") {
     if (!scope || overviewBusy) return;
     const revision = scopeState.current.revision;
@@ -278,13 +421,77 @@ export default function App({ authenticated = false }: { authenticated?: boolean
     }
   }
 
-  function openHistory(item: QueryResult) {
-    setResult(item);
+  function openHistory(item: QueryResult | AssistantRun) {
+    if ("kind" in item) {
+      switchMode(item.kind === "coding" ? "coding" : "general");
+      setAssistant(item);
+      setResult(null);
+    } else {
+      switchMode("knowledge");
+      setResult(item);
+      setRetrievalMode(item.retrieval_mode);
+    }
     setQuestion(item.question);
-    setRetrievalMode(item.retrieval_mode);
     setSource(null);
     setView("workspace");
   }
+
+  const renderAssistantCard = (run: AssistantRun, isHistory = false) => (
+    <section className="answer-card" aria-label={run.kind === "coding" ? "Coding answer" : "Assistant answer"}>
+      <div className="answer-top">
+        <span>
+          {run.kind === "coding" ? <Code2 size={17} /> : <MessagesSquare size={17} />}
+          {run.kind === "coding"
+            ? `Code ${codingTaskNames[run.task] ?? run.task}`
+            : "Assistant"}
+          {run.grounded && <em className="grounded-flag"> · grounded in your documents</em>}
+        </span>
+        <span className="elapsed">{(run.timings.total_ms / 1000).toFixed(1)} s</span>
+      </div>
+      <h2>{run.question}</h2>
+      <AnswerBody answer={run.answer} />
+      {run.sources.length > 0 && (
+        <div className="citation-row">
+          {run.sources.map((source_, i) => (
+            <button
+              className="citation"
+              key={`${source_.chunk_id}:${i}`}
+              onClick={() =>
+                setSource({
+                  ...source_,
+                  quote: source_.text,
+                })
+              }
+            >
+              <FileText size={13} />
+              {source_.document_name} · p. {source_.page}
+              <ArrowUpRight size={12} />
+            </button>
+          ))}
+        </div>
+      )}
+      {run.grounded && run.sources.length === 0 && (
+        <div className="no-answer-note">
+          <p>
+            No knowledge-base passage matched this request, so the answer uses
+            general programming knowledge only.
+          </p>
+        </div>
+      )}
+      <p className="verification-note">
+        {run.kind === "coding"
+          ? "Generated code is not executed anywhere. Review and test it before use."
+          : "General assistant answers are not grounded in your documents."}
+      </p>
+      {!isHistory && (
+        <div className="run-meta">
+          <span>{run.language ? run.language : "general"}</span>
+          <span>Generation {(run.timings.generation_ms / 1000).toFixed(1)} s</span>
+          {run.model && <span>{run.model}</span>}
+        </div>
+      )}
+    </section>
+  );
 
   function selectCandidate(id: string) {
     setScope(id);
@@ -487,16 +694,39 @@ export default function App({ authenticated = false }: { authenticated?: boolean
             <Upload size={21} />
           )}
           <strong>{uploading ? "Saving document…" : "Add a document"}</strong>
-          <small>Drop a text or scanned PDF</small>
+          <small>PDF, DOCX, TXT, MD, CSV or JSON</small>
         </button>
         <input
           ref={input}
           type="file"
           aria-label="Upload PDF"
-          accept="application/pdf,.pdf"
+          accept=".pdf,.docx,.txt,.md,.csv,.json"
           hidden
           onChange={(e) => void upload(e.target.files?.[0])}
         />
+        <div className="url-ingest">
+          <input
+            type="url"
+            aria-label="Web page URL"
+            placeholder="Add a web page (https://…)"
+            value={pageUrl}
+            onChange={(e) => setPageUrl(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                e.preventDefault();
+                void addWebPage();
+              }
+            }}
+          />
+          <button
+            aria-label="Add web page"
+            title="Fetch this page into the knowledge base"
+            disabled={addingUrl || !pageUrl.trim()}
+            onClick={() => void addWebPage()}
+          >
+            {addingUrl ? <LoaderCircle className="spin" size={14} /> : <Link2 size={14} />}
+          </button>
+        </div>
         <div className="document-list" aria-live="polite">
           {documents.length === 0 && (
             <p className="empty-docs">
@@ -511,7 +741,7 @@ export default function App({ authenticated = false }: { authenticated?: boolean
               <div className="document-content">
                 <button
                   className={`document-name ${scope === doc.id ? "active" : ""}`}
-                  title={doc.name}
+                  title={doc.source_url ?? doc.name}
                   onClick={() =>
                     doc.status === "ready"
                       ? setScope(doc.id)
@@ -528,7 +758,7 @@ export default function App({ authenticated = false }: { authenticated?: boolean
                 </button>
                 <small className={`status status-${doc.status}`}>
                   {doc.status === "ready"
-                    ? `${doc.page_count} pages · indexed`
+                    ? `${doc.kind === "url" ? "web page" : doc.kind === "text" ? "text" : `${doc.page_count} pages`} · indexed`
                     : doc.status === "processing"
                       ? "Extracting and indexing…"
                       : doc.status === "queued"
@@ -569,19 +799,35 @@ export default function App({ authenticated = false }: { authenticated?: boolean
                   </p>
                 ))}
               </div>
+              <button
+                className="doc-delete"
+                aria-label={`Delete ${doc.name}`}
+                title="Remove this document and its indexes"
+                onClick={() => void deleteDocument(doc.id)}
+              >
+                <Trash2 size={13} />
+              </button>
               {doc.status === "ready" && (
                 <button
                   className="doc-view-button"
-                  aria-label={`View PDF of ${doc.name}`}
-                  title="View the original PDF"
+                  aria-label={
+                    doc.source_url
+                      ? `Open source page of ${doc.name}`
+                      : doc.kind === "text"
+                        ? `View text of ${doc.name}`
+                        : `View PDF of ${doc.name}`
+                  }
+                  title={doc.source_url ? "Open the source page" : "View the original PDF"}
                   onClick={() =>
-                    setSource({
-                      document_id: doc.id,
-                      document_name: doc.name,
-                      page: 1,
-                      quote: "",
-                      chunk_id: "",
-                    })
+                    doc.source_url
+                      ? window.open(doc.source_url, "_blank", "noreferrer")
+                      : setSource({
+                          document_id: doc.id,
+                          document_name: doc.name,
+                          page: 1,
+                          quote: "",
+                          chunk_id: "",
+                        })
                   }
                 >
                   <FileText size={13} />
@@ -629,13 +875,33 @@ export default function App({ authenticated = false }: { authenticated?: boolean
           <main>
             <div className="page-heading">
               <div>
-                <div className="eyebrow">KNOWLEDGE, WITH EVIDENCE</div>
+                <div className="eyebrow">
+                  {view === "history"
+                    ? "KNOWLEDGE, WITH EVIDENCE"
+                    : mode === "coding"
+                      ? "CODE, DEBUGGED AND IMPROVED"
+                      : mode === "general"
+                        ? "GENERAL ASSISTANT"
+                        : "KNOWLEDGE, WITH EVIDENCE"}
+                </div>
                 <h1>
                   {view === "history"
                     ? "Your research trail"
-                    : "Discover your documents."}
+                    : mode === "coding"
+                      ? "Write, debug and improve code."
+                      : mode === "general"
+                        ? "Ask anything."
+                        : "Discover your documents."}
                 </h1>
-                <p>Ask a question. Follow the evidence back to its source.</p>
+                <p>
+                  {view === "history"
+                    ? "Ask a question. Follow the evidence back to its source."
+                    : mode === "coding"
+                      ? "Describe a task, paste code, or ground requests in your documents."
+                      : mode === "general"
+                        ? "General conversation, independent of your documents."
+                        : "Ask a question. Follow the evidence back to its source."}
+                </p>
               </div>
               <div className="index-stat">
                 <strong>{pages}</strong>
@@ -722,13 +988,17 @@ export default function App({ authenticated = false }: { authenticated?: boolean
                       <span>
                         <strong>{item.question}</strong>
                         <small>
-                          {item.status === "answered"
-                            ? item.verification === "document_summary"
-                              ? "Document summary"
-                              : "Cited answer"
-                            : item.status === "clarification_needed"
-                              ? "Needed a document choice"
-                              : statusLabels[item.status] ?? item.status}{" "}
+                          {"kind" in item
+                            ? item.kind === "coding"
+                              ? `Code ${codingTaskNames[item.task] ?? item.task} answer`
+                              : "Assistant answer"
+                            : item.status === "answered"
+                              ? item.verification === "document_summary"
+                                ? "Document summary"
+                                : "Cited answer"
+                              : item.status === "clarification_needed"
+                                ? "Needed a document choice"
+                                : statusLabels[item.status] ?? item.status}{" "}
                           · {(item.timings.total_ms / 1000).toFixed(1)} s
                         </small>
                       </span>
@@ -745,17 +1015,75 @@ export default function App({ authenticated = false }: { authenticated?: boolean
               </div>
             ) : (
               <>
-                <form className="question-box" onSubmit={ask}>
+                <div className="mode-selector" role="tablist" aria-label="Assistant mode">
+                  <button
+                    role="tab"
+                    aria-selected={mode === "knowledge"}
+                    className={mode === "knowledge" ? "active" : ""}
+                    onClick={() => switchMode("knowledge")}
+                  >
+                    <Search size={15} /> Knowledge Assistant
+                  </button>
+                  <button
+                    role="tab"
+                    aria-selected={mode === "coding"}
+                    className={mode === "coding" ? "active" : ""}
+                    onClick={() => switchMode("coding")}
+                  >
+                    <Code2 size={15} /> Coding Assistant
+                  </button>
+                  <button
+                    role="tab"
+                    aria-selected={mode === "general"}
+                    className={mode === "general" ? "active" : ""}
+                    onClick={() => switchMode("general")}
+                  >
+                    <MessagesSquare size={15} /> General AI
+                  </button>
+                </div>
+                {mode !== "knowledge" && !codingReady && (
+                  <div className="alert warning" role="status">
+                    <CircleAlert size={17} />
+                    <span>
+                      The assistant model for this mode is not reachable
+                      {readiness?.coding?.model ? ` (${readiness.coding.model})` : ""}.
+                      Check the provider settings or start Ollama.
+                    </span>
+                  </div>
+                )}
+                <form
+                  className="question-box"
+                  onSubmit={mode === "knowledge" ? ask : sendAssistant}
+                >
                   <label htmlFor="question">
-                    <Search size={17} /> Ask your workspace
-                    {scopedDoc ? ` · ${scopedDoc.name}` : ""}
+                    {mode === "knowledge" ? (
+                      <>
+                        <Search size={17} /> Ask your workspace
+                        {scopedDoc ? ` · ${scopedDoc.name}` : ""}
+                      </>
+                    ) : mode === "coding" ? (
+                      <>
+                        <Code2 size={17} /> Describe the coding task
+                        {scope ? " · using selected documents" : ""}
+                      </>
+                    ) : (
+                      <>
+                        <MessagesSquare size={17} /> Ask anything
+                      </>
+                    )}
                   </label>
                   <textarea
                     id="question"
                     value={question}
-                    maxLength={1200}
+                    maxLength={4000}
                     rows={3}
-                    placeholder="What would you like to uncover?"
+                    placeholder={
+                      mode === "knowledge"
+                        ? "What would you like to uncover?"
+                        : mode === "coding"
+                          ? "e.g. Write a Python function that checks whether a number is prime."
+                          : "Ask a general question — no documents involved."
+                    }
                     onChange={(e) => setQuestion(e.target.value)}
                     onKeyDown={(e) => {
                       if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
@@ -764,46 +1092,106 @@ export default function App({ authenticated = false }: { authenticated?: boolean
                       }
                     }}
                   />
-                  <div className="question-footer">
-                    <select
-                      aria-label="Document scope"
-                      value={scope}
-                      onChange={(e) => setScope(e.target.value)}
-                    >
-                      <option value="">All indexed documents</option>
-                      {ready.map((doc) => (
-                        <option key={doc.id} value={doc.id}>
-                          {doc.name}
-                        </option>
-                      ))}
-                    </select>
-                    <select
-                      aria-label="Search method"
-                      value={
-                        retrievalMode ||
-                        readiness?.default_retrieval_mode ||
-                        "bm25"
-                      }
-                      onChange={(e) => setRetrievalMode(e.target.value)}
-                    >
-                      {Object.entries(retrievalNames)
-                        .filter(([mode]) => mode !== "coverage" && mode !== "summary")
-                        .map(([mode, name]) => (
-                          <option
-                            key={mode}
-                            value={mode}
-                            disabled={
-                              mode !== "bm25" && !readiness?.retrieval?.enabled
-                            }
+                  {mode === "coding" && (
+                    <>
+                      <div className="task-row" role="group" aria-label="Coding task">
+                        {Object.entries(codingTaskNames).map(([value, name]) => (
+                          <button
+                            key={value}
+                            type="button"
+                            className={task === value ? "active" : ""}
+                            onClick={() => setTask(value)}
                           >
                             {name}
+                          </button>
+                        ))}
+                      </div>
+                      <button
+                        type="button"
+                        className="attach-toggle"
+                        onClick={() => setShowAttach((value) => !value)}
+                      >
+                        <Paperclip size={14} />
+                        {showAttach ? "Hide code & error input" : "Attach code or an error / traceback"}
+                      </button>
+                      {showAttach && (
+                        <div className="attach-grid">
+                          <label>
+                            Code
+                            <textarea
+                              aria-label="Code input"
+                              value={codeInput}
+                              maxLength={20000}
+                              rows={6}
+                              placeholder="Paste the code to explain, debug, improve or review…"
+                              onChange={(e) => setCodeInput(e.target.value)}
+                            />
+                          </label>
+                          <label>
+                            Error message, traceback or output
+                            <textarea
+                              aria-label="Error or output input"
+                              value={errorInput}
+                              maxLength={4000}
+                              rows={4}
+                              placeholder="Paste the error, traceback, log or unexpected output…"
+                              onChange={(e) => setErrorInput(e.target.value)}
+                            />
+                          </label>
+                        </div>
+                      )}
+                    </>
+                  )}
+                  <div className="question-footer">
+                    {mode !== "general" && (
+                      <select
+                        aria-label="Document scope"
+                        value={scope}
+                        onChange={(e) => setScope(e.target.value)}
+                      >
+                        <option value="">
+                          {mode === "coding"
+                            ? "No project documents (general coding)"
+                            : "All indexed documents"}
+                        </option>
+                        {ready.map((doc) => (
+                          <option key={doc.id} value={doc.id}>
+                            {doc.name}
                           </option>
                         ))}
-                    </select>
+                      </select>
+                    )}
+                    {mode === "knowledge" && (
+                      <select
+                        aria-label="Search method"
+                        value={
+                          retrievalMode ||
+                          readiness?.default_retrieval_mode ||
+                          "bm25"
+                        }
+                        onChange={(e) => setRetrievalMode(e.target.value)}
+                      >
+                        {Object.entries(retrievalNames)
+                          .filter(([mode]) => mode !== "coverage" && mode !== "summary")
+                          .map(([mode, name]) => (
+                            <option
+                              key={mode}
+                              value={mode}
+                              disabled={
+                                mode !== "bm25" && !readiness?.retrieval?.enabled
+                              }
+                            >
+                              {name}
+                            </option>
+                          ))}
+                      </select>
+                    )}
                     <button
                       className="ask-button"
                       disabled={
-                        busy || !ready.length || question.trim().length < 3
+                        busy ||
+                        question.trim().length < 3 ||
+                        (mode === "knowledge" && !ready.length)
                       }
                       type="submit"
                     >
@@ -812,11 +1200,21 @@ export default function App({ authenticated = false }: { authenticated?: boolean
                       ) : (
                         <ArrowUp size={17} />
                       )}
-                      <span>{busy ? "Reading evidence…" : "Ask question"}</span>
+                      <span>
+                        {busy
+                          ? mode === "knowledge"
+                            ? "Reading evidence…"
+                            : "Generating…"
+                          : mode === "knowledge"
+                            ? "Ask question"
+                            : mode === "coding"
+                              ? "Send code request"
+                              : "Send message"}
+                      </span>
                     </button>
                   </div>
                 </form>
-                {scopedDoc && (
+                {mode === "knowledge" && scopedDoc && (
                   <section className="overview-card" aria-label="Document overview">
                     <div className="overview-head">
                       <span className="overview-title">
@@ -953,26 +1351,63 @@ export default function App({ authenticated = false }: { authenticated?: boolean
                     <LoaderCircle size={22} className="spin" />
                     <div>
                       <strong>
-                        Retrieving passages and preparing an answer
+                        {mode === "knowledge"
+                          ? "Retrieving passages and preparing an answer"
+                          : mode === "coding"
+                            ? "Writing code and explanations"
+                            : "Preparing an answer"}
                       </strong>
                       <p>
-                        Local inference can take a moment. Source references
-                        will be checked.
+                        {mode === "knowledge"
+                          ? "Local inference can take a moment. Source references will be checked."
+                          : "Generated code is never executed on this machine."}
                       </p>
                     </div>
                   </div>
                 )}
-                {result && !busy && renderAnswerCard(result)}
-                {result &&
-                  !busy &&
-                  result.status === "answered" &&
-                  thread.length > 0 && (
-                    <p className="followup-hint">
-                      Ask a follow-up — the last exchange stays in context for
-                      references like “it” or “they”.
+                {mode === "knowledge"
+                  ? result && !busy && renderAnswerCard(result)
+                  : assistant && !busy && renderAssistantCard(assistant)}
+                {mode === "knowledge"
+                  ? result &&
+                    !busy &&
+                    result.status === "answered" &&
+                    thread.length > 0 && (
+                      <p className="followup-hint">
+                        Ask a follow-up — the last exchange stays in context for
+                        references like “it” or “they”.
+                      </p>
+                    )
+                  : assistant && !busy && assistantThread.length > 0 && (
+                      <p className="followup-hint">
+                        Ask a follow-up — the previous exchanges stay in context.
+                      </p>
+                    )}
+                {mode !== "knowledge" && !assistant && !busy && (
+                  <div className="starting-point">
+                    <div className="section-label">
+                      {mode === "coding" ? "A STARTING POINT" : "TRY ASKING"}
+                    </div>
+                    {(mode === "coding" ? codingExamples : [
+                      "Explain the difference between HTTP GET and POST.",
+                      "What are the trade-offs of microservices?",
+                    ]).map((example) => (
+                      <button
+                        key={example}
+                        onClick={() => setQuestion(example)}
+                      >
+                        {example}
+                        <ArrowUpRight size={16} />
+                      </button>
+                    ))}
+                    <p>
+                      {mode === "coding"
+                        ? "Select a document above to ground code requests in your uploaded documentation."
+                        : "General questions do not use your documents."}
                     </p>
-                  )}
-                {!result && !busy && !scopedDoc && (
+                  </div>
+                )}
+                {mode === "knowledge" && !result && !busy && !scopedDoc && (
                   <div className="starting-point">
                     <div className="section-label">A STARTING POINT</div>
                     {examples.map((example) => (
@@ -990,7 +1425,7 @@ export default function App({ authenticated = false }: { authenticated?: boolean
                     </p>
                   </div>
                 )}
-                {!result && !busy && (
+                {mode === "knowledge" && !result && !busy && (
                   <div className="empty-state">
                     <div className="empty-icon">
                       <Layers3 size={28} />

@@ -12,6 +12,7 @@ from contextlib import asynccontextmanager, closing
 from typing import Literal
 from uuid import UUID, uuid4
 
+import httpx
 from fastapi import FastAPI, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel, Field, field_validator
@@ -19,14 +20,23 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.staticfiles import StaticFiles
 
 from omnirag.auth import AuthStore, install_auth
+from omnirag.coding import (
+    MAX_CODE_CHARACTERS,
+    MAX_ERROR_CHARACTERS,
+    CodingService,
+    build_gateway,
+)
 from omnirag.config import Settings
 from omnirag.db import (
     connection,
+    delete_document_everywhere,
     document_chunks,
     get_document,
     get_summary,
     initialize,
+    insert_ready_document,
     public_document,
+    save_assistant_run,
     save_summary,
     summary_states,
 )
@@ -41,6 +51,13 @@ from omnirag.generation import (
     verify_individual_record,
 )
 from omnirag.hybrid import HybridIndex, RetrievalError
+from omnirag.ingestion import (
+    IngestionError,
+    fetch_url_text,
+    parse_docx,
+    parse_text_document,
+    parse_web_page,
+)
 from omnirag.intents import OVERVIEW_KINDS, classify_intent, is_action_request
 from omnirag.retrieval import retrieve
 from omnirag.security import LocalRequestGuard
@@ -53,6 +70,28 @@ class ConversationTurn(BaseModel):
     question: str = Field(min_length=1, max_length=1200)
     answer: str = Field(default="", max_length=1200)
     document_ids: list[UUID] = Field(default_factory=list, max_length=5)
+
+
+class CodingTurn(BaseModel):
+    question: str = Field(min_length=1, max_length=2000)
+    answer: str = Field(default="", max_length=4000)
+
+
+class ChatInput(BaseModel):
+    question: str = Field(min_length=3, max_length=4000)
+    conversation: list[CodingTurn] = Field(default_factory=list, max_length=2)
+
+
+class CodingInput(ChatInput):
+    task: Literal["generate", "explain", "debug", "improve", "review", "auto"] = "auto"
+    code: str = Field(default="", max_length=MAX_CODE_CHARACTERS)
+    error: str = Field(default="", max_length=MAX_ERROR_CHARACTERS)
+    language: str = Field(default="", max_length=40)
+    document_ids: list[UUID] = Field(default_factory=list, max_length=10)
+
+
+class UrlInput(BaseModel):
+    url: str = Field(min_length=8, max_length=2048)
 
 
 class QueryInput(BaseModel):
@@ -77,9 +116,13 @@ def fail(status: int, code: str, message: str):
     raise HTTPException(status_code=status, detail={"code": code, "message": message})
 
 
-def create_app(settings: Settings | None = None, gateway=None, index=None) -> FastAPI:
+def create_app(
+    settings: Settings | None = None, gateway=None, index=None, coding_gateway=None
+) -> FastAPI:
     settings = settings or Settings()
     gateway = gateway or OllamaGateway(settings)
+    coding_gateway = coding_gateway or build_gateway(settings)
+    coding_service = CodingService(settings, coding_gateway)
     generation_slot = threading.BoundedSemaphore(1)
     auth_store = AuthStore(settings.data_dir.resolve() / "auth")
     index = index or (HybridIndex(settings) if settings.retrieval_enabled else None)
@@ -129,6 +172,7 @@ def create_app(settings: Settings | None = None, gateway=None, index=None) -> Fa
             "retrieval": settings.default_retrieval_mode,
             "authentication": settings.auth_enabled,
             "answer_mode": settings.answer_mode,
+            "coding_provider": settings.code_provider,
         }
 
     @app.get("/api/v1/readiness")
@@ -149,6 +193,7 @@ def create_app(settings: Settings | None = None, gateway=None, index=None) -> Fa
             "default_retrieval_mode": settings.default_retrieval_mode,
             "ocr": {"enabled": settings.ocr_enabled, "language": "eng"},
             "answer_mode": settings.answer_mode,
+            "coding": {"provider": settings.code_provider, **coding_gateway.ready()},
         }
 
     @app.get("/api/v1/documents")
@@ -160,24 +205,41 @@ def create_app(settings: Settings | None = None, gateway=None, index=None) -> Fa
                 for row in con.execute("SELECT document_id, status, error FROM vector_jobs")
             }
             summaries = summary_states(settings.database)
-            return [
-                {
-                    **public_document(row),
-                    "vector_status": jobs.get(row["id"], {}).get("status"),
-                    "vector_error": jobs.get(row["id"], {}).get("error"),
-                    "summary_status": summaries.get(row["id"], {}).get("overview"),
-                    "detailed_summary_status": summaries.get(row["id"], {}).get("detailed"),
-                }
-                for row in rows
-            ]
+            results = []
+            for row in rows:
+                kind = (
+                    "url"
+                    if row["source_url"]
+                    else "pdf"
+                    if (settings.uploads / f"{row['id']}.pdf").is_file()
+                    else "text"
+                )
+                results.append(
+                    {
+                        **public_document(row),
+                        "kind": kind,
+                        "vector_status": jobs.get(row["id"], {}).get("status"),
+                        "vector_error": jobs.get(row["id"], {}).get("error"),
+                        "summary_status": summaries.get(row["id"], {}).get("overview"),
+                        "detailed_summary_status": summaries.get(row["id"], {}).get("detailed"),
+                    }
+                )
+            return results
+
+    TEXT_SUFFIXES = {".txt", ".md", ".csv", ".json"}
 
     @app.post("/api/v1/documents", status_code=202)
     async def upload(file: UploadFile):
         original = (file.filename or "document.pdf").replace("\\", "/").rsplit("/", 1)[-1]
         name = re.sub(r"[\x00-\x1f\x7f]", "", original)[:180]
-        if not name.lower().endswith(".pdf"):
+        suffix = f".{name.rsplit('.', 1)[1].lower()}" if "." in name else ""
+        if suffix != ".pdf" and suffix not in TEXT_SUFFIXES and suffix != ".docx":
             await file.close()
-            fail(415, "UNSUPPORTED_TYPE", "This phase accepts PDF files only.")
+            fail(
+                415,
+                "UNSUPPORTED_TYPE",
+                "Supported formats: PDF, DOCX, TXT, Markdown, CSV and JSON.",
+            )
         document_id = str(uuid4())
         temporary = settings.uploads / f"{document_id}.part"
         destination = settings.uploads / f"{document_id}.pdf"
@@ -188,27 +250,67 @@ def create_app(settings: Settings | None = None, gateway=None, index=None) -> Fa
                 while block := await file.read(1024 * 1024):
                     size += len(block)
                     if size > settings.upload_max_mb * 1024 * 1024:
-                        fail(413, "UPLOAD_TOO_LARGE", "PDF exceeds the configured upload limit.")
+                        fail(
+                            413,
+                            "UPLOAD_TOO_LARGE",
+                            "The file exceeds the configured upload limit.",
+                        )
                     if not prefix:
                         prefix = block[:5]
                     digest.update(block)
                     target.write(block)
-            if prefix != b"%PDF-":
-                fail(415, "INVALID_PDF_HEADER", "The uploaded file does not have a PDF signature.")
-            with connection(settings.database) as con:
-                con.execute("BEGIN IMMEDIATE")
-                existing = con.execute(
-                    "SELECT * FROM documents WHERE sha256=?", (digest.hexdigest(),)
-                ).fetchone()
-                if existing:
-                    return {"document": public_document(existing), "duplicate": True}
-                os.replace(temporary, destination)
-                con.execute(
-                    "INSERT INTO documents(id,name,sha256,size_bytes,created_at,status) "
-                    "VALUES(?,?,?,?,?,'queued')",
-                    (document_id, name, digest.hexdigest(), size, time.time()),
-                )
-            stored = True
+            if suffix == ".pdf":
+                if prefix != b"%PDF-":
+                    fail(
+                        415,
+                        "INVALID_PDF_HEADER",
+                        "The uploaded file does not have a PDF signature.",
+                    )
+                with connection(settings.database) as con:
+                    con.execute("BEGIN IMMEDIATE")
+                    existing = con.execute(
+                        "SELECT * FROM documents WHERE sha256=?", (digest.hexdigest(),)
+                    ).fetchone()
+                    if existing:
+                        return {"document": public_document(existing), "duplicate": True}
+                    os.replace(temporary, destination)
+                    con.execute(
+                        "INSERT INTO documents(id,name,sha256,size_bytes,created_at,status) "
+                        "VALUES(?,?,?,?,?,'queued')",
+                        (document_id, name, digest.hexdigest(), size, time.time()),
+                    )
+                stored = True
+                return {
+                    "document": public_document(get_document(settings.database, document_id)),
+                    "duplicate": False,
+                }
+            # Text formats extract synchronously and enter the same chunk/FTS/vector
+            # pipeline as ready PDFs, with synthetic pages for page-linked citations.
+            if size == 0:
+                fail(422, "EMPTY_DOCUMENT", "The uploaded file is empty.")
+            try:
+                if suffix == ".docx":
+                    result = parse_docx(temporary)
+                else:
+                    result = parse_text_document(temporary, suffix)
+            except IngestionError as exc:
+                fail(422, exc.code, exc.message)
+            record = {
+                "id": document_id,
+                "name": name,
+                "sha256": digest.hexdigest(),
+                "size_bytes": size,
+            }
+            try:
+                insert_ready_document(settings.database, record, result)
+            except ValueError:
+                with connection(settings.database) as con:
+                    existing = con.execute(
+                        "SELECT * FROM documents WHERE sha256=?", (digest.hexdigest(),)
+                    ).fetchone()
+                if existing is None:
+                    fail(502, "INGEST_FAILED", "The document could not be stored.")
+                return {"document": public_document(existing), "duplicate": True}
             return {
                 "document": public_document(get_document(settings.database, document_id)),
                 "duplicate": False,
@@ -235,12 +337,30 @@ def create_app(settings: Settings | None = None, gateway=None, index=None) -> Fa
                     (str(document_id),),
                 )
             ]
+        pdf_path = settings.uploads / f"{document_id}.pdf"
+        kind = (
+            "url" if row["source_url"] else "pdf" if pdf_path.is_file() else "text"
+        )
         return {
             **public_document(row),
+            "kind": kind,
             "vector_status": job["status"] if job else None,
             "vector_error": job["error"] if job else None,
             "pages": pages,
         }
+
+    @app.delete("/api/v1/documents/{document_id}")
+    def delete_document(document_id: UUID):
+        """Remove a source and its derived data from every store, or nothing."""
+        document_id = str(document_id)
+        row = delete_document_everywhere(settings.database, document_id)
+        if not row:
+            fail(404, "DOCUMENT_NOT_FOUND", "Document not found.")
+        (settings.uploads / f"{document_id}.pdf").unlink(missing_ok=True)
+        (settings.uploads / f"{document_id}.part").unlink(missing_ok=True)
+        if index:
+            index.delete_document(document_id)
+        return {"deleted": True, "id": document_id}
 
     @app.post("/api/v1/documents/{document_id}/retry", status_code=202)
     def retry_document(document_id: UUID):
@@ -597,6 +717,125 @@ def create_app(settings: Settings | None = None, gateway=None, index=None) -> Fa
                 "UPDATE vector_jobs SET status='pending', error=NULL WHERE status='failed'"
             ).rowcount
         return {"queued": count}
+
+    # --- AI coding assistant and general chat (plain-text generation workflows) ---
+
+    def coding_sources(passages: list[dict]) -> list[dict]:
+        return [
+            {
+                "chunk_id": passage["chunk_id"],
+                "document_id": passage["document_id"],
+                "document_name": passage["document_name"],
+                "page": passage["page"],
+                "text": passage["text"][:600],
+            }
+            for passage in passages
+        ]
+
+    def run_assistant(kind: str, body: CodingInput | ChatInput, task: str):
+        started = time.perf_counter()
+        question = body.question.strip()
+        passages: list[dict] = []
+        scope = []
+        if kind == "coding" and isinstance(body, CodingInput) and body.document_ids:
+            scope = [str(item) for item in dict.fromkeys(body.document_ids)]
+            check_scope(scope)
+            passages = retrieve(settings.database, question, scope, settings.top_k)
+        if not generation_slot.acquire(blocking=False):
+            fail(429, "MODEL_BUSY", "Another answer is running. Please try again shortly.")
+        try:
+            result = coding_service.assist(
+                question,
+                task,
+                code=getattr(body, "code", ""),
+                error=getattr(body, "error", ""),
+                language=getattr(body, "language", ""),
+                conversation=[turn.model_dump() for turn in body.conversation],
+                passages=passages,
+            )
+        except GenerationError as exc:
+            fail(exc.status_code, exc.code, exc.message)
+        finally:
+            generation_slot.release()
+        run_id = str(uuid4())
+        model = (
+            settings.openrouter_model
+            if settings.code_provider == "openrouter"
+            else settings.ollama_code_model or settings.ollama_model
+        )
+        response = {
+            "id": run_id,
+            "kind": kind,
+            "task": result["task"],
+            "question": question,
+            "status": "answered",
+            "answer": result["answer"],
+            "language": result["language"],
+            "grounded": result["grounded"],
+            "sources": coding_sources(passages) if result["grounded"] else [],
+            "model": model,
+            "verification": "assistant_generated",
+            "retrieval_mode": "bm25" if result["grounded"] else None,
+            "retrieval_collection": None,
+            "timings": {
+                "retrieval_ms": 0,
+                "generation_ms": round((time.perf_counter() - started) * 1000, 2),
+                "total_ms": round((time.perf_counter() - started) * 1000, 2),
+            },
+        }
+        save_assistant_run(settings.database, run_id, kind, result["task"], question, response)
+        return response
+
+    @app.post("/api/v1/coding/assist")
+    def coding_assist(body: CodingInput):
+        task = body.task if body.task != "auto" else "auto"
+        return run_assistant("coding", body, task)
+
+    @app.post("/api/v1/assistant/chat")
+    def assistant_chat(body: ChatInput):
+        return run_assistant("chat", body, "chat")
+
+    # --- Web page ingestion (ported from the RAG project, with SSRF guards) ---
+
+    @app.post("/api/v1/urls", status_code=202)
+    def ingest_url(body: UrlInput):
+        try:
+            text, title, final_url = fetch_url_text(
+                body.url,
+                settings.url_fetch_timeout_seconds,
+                settings.url_fetch_max_mb,
+            )
+            result = parse_web_page(text)
+        except IngestionError as exc:
+            fail(422, exc.code, exc.message)
+        except httpx.HTTPStatusError as exc:
+            fail(
+                502,
+                "URL_FETCH_FAILED",
+                f"The page responded with HTTP {exc.response.status_code}.",
+            )
+        except httpx.HTTPError:
+            fail(502, "URL_FETCH_FAILED", "The page could not be fetched.")
+        document_id = str(uuid4())
+        name = re.sub(r"[\x00-\x1f\x7f]", "", title or final_url)[:180] or "Web page"
+        record = {
+            "id": document_id,
+            "name": name,
+            "sha256": hashlib.sha256(text.encode()).hexdigest(),
+            "size_bytes": len(text.encode()),
+            "source_url": final_url,
+        }
+        try:
+            insert_ready_document(settings.database, record, result)
+        except ValueError:
+            with connection(settings.database) as con:
+                existing = con.execute(
+                    "SELECT * FROM documents WHERE sha256=?", (record["sha256"],)
+                ).fetchone()
+            if existing is None:
+                fail(502, "INGEST_FAILED", "The page could not be stored.")
+            return {"document": public_document(existing), "duplicate": True}
+        return {"document": public_document(get_document(settings.database, document_id))}
 
     @app.post("/api/v1/queries")
     def query(body: QueryInput):
@@ -956,11 +1195,19 @@ def create_app(settings: Settings | None = None, gateway=None, index=None) -> Fa
 
     @app.get("/api/v1/history")
     def history():
+        runs = []
         with connection(settings.database) as con:
             rows = con.execute(
-                "SELECT response FROM query_runs ORDER BY created_at DESC LIMIT 20"
+                "SELECT created_at, response FROM query_runs ORDER BY created_at DESC LIMIT 20"
             ).fetchall()
-            return [json.loads(row[0]) for row in rows]
+            for row in rows:
+                runs.append((row["created_at"], json.loads(row["response"])))
+            for row in con.execute(
+                "SELECT created_at, response FROM assistant_runs ORDER BY created_at DESC LIMIT 20"
+            ).fetchall():
+                runs.append((row["created_at"], json.loads(row["response"])))
+        runs.sort(key=lambda item: -item[0])
+        return [response for _created_at, response in runs[:20]]
 
     if settings.serve_frontend:
         app.mount("/", StaticFiles(directory=settings.frontend_dist, html=True), name="frontend")

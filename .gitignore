@@ -5,8 +5,7 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .coverage
-data/local/
-data/models/
+data/
 frontend/node_modules/
 frontend/dist/
 frontend/test-results/

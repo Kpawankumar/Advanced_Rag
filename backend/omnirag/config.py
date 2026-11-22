@@ -14,6 +14,19 @@ class Settings(BaseSettings):
     frontend_dist: Path = Path("frontend/dist")
     ollama_base_url: HttpUrl = HttpUrl("http://127.0.0.1:11434")
     ollama_model: str = "qwen3-vl:2b-instruct"
+    # Coding assistant / general chat: plain-text generation with one of the two
+    # existing provider integrations. "ollama" is the local gateway above;
+    # "openrouter" is the OpenRouter client ported from the RAG project.
+    code_provider: Literal["ollama", "openrouter"] = "ollama"
+    ollama_code_model: str = ""
+    openrouter_base_url: HttpUrl = HttpUrl("https://openrouter.ai/api/v1")
+    openrouter_api_key: str = ""
+    openrouter_model: str = "openai/gpt-5.2"
+    openrouter_http_referer: str = ""
+    openrouter_title: str = ""
+    code_max_output_tokens: int = Field(default=2048, ge=256, le=8192)
+    url_fetch_timeout_seconds: int = Field(default=20, ge=5, le=60)
+    url_fetch_max_mb: int = Field(default=5, ge=1, le=25)
     # "grounded" writes answers with validated citations; "extractive" replies with
     # verbatim selected excerpts only (the Phase 5-11 behavior, kept selectable).
     answer_mode: Literal["grounded", "extractive"] = "grounded"
