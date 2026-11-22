@@ -94,6 +94,22 @@ memory allows, measured against this fixture suite; searchable history with expo
 incremental indexing and duplicate detection; multi-document comparison. None are
 scheduled; each would start as its own evaluated phase.
 
+## Development setup on Windows
+
+Double-click [Open OmniRAG.bat](Open%20OmniRAG.bat) to start Ollama, the API, the
+ingestion worker and the Vite dev server in separate windows. First-time setup:
+
+```bat
+winget install Ollama.Ollama
+ollama pull qwen3-vl:2b-instruct
+ollama pull qwen2.5-coder:3b
+python -m venv .venv && .venv\Scripts\pip install -e .
+npm --prefix frontend install
+```
+
+The UI is at http://127.0.0.1:5173 and the API at http://127.0.0.1:8000.
+Close the service windows to stop the app.
+
 ## Development setup on the M1 Mac
 
 For the installed private app, use the launcher above. The separate API/Vite commands below describe the development stack and do not enable authentication by default. Do not start them alongside the installed app. See [Phase 10](docs/PHASE10.md) for private startup, stop and recovery commands.
